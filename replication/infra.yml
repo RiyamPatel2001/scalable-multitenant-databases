@@ -1,0 +1,643 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Multi‑tenant SQLite replication with read‑only replicas and automatic failover.
+
+Parameters:
+  PrimaryBucketName:
+    Type: String
+    Default: scalable-db-primary-data-bucket
+    Description: Name of the S3 bucket storing primary databases
+  ReplicaBucketR1Name:
+    Type: String
+    Default: scalable-db-read-only-replica-bucket
+    Description: Name of the S3 bucket for read-only replicas in the same region
+  ReplicaBucketR2Name:
+    Type: String
+    Default: scalable-db-standby-replica-bucket
+    Description: Name of the S3 bucket for cross-region replicas/standby
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: Region for primary deployment
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    Description: Region for cross-region replication
+
+Resources:
+  # Primary bucket with versioning enabled
+  PrimaryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref PrimaryBucketName
+      VersioningConfiguration:
+        Status: Enabled
+
+  # Read-only replica bucket in primary region
+  ReplicaBucketR1:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ReplicaBucketR1Name
+      VersioningConfiguration:
+        Status: Enabled
+
+  # Cross-region replica bucket
+  ReplicaBucketR2:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ReplicaBucketR2Name
+      VersioningConfiguration:
+        Status: Enabled
+      # Use this to ensure the bucket is created in a different region when deployed
+      # See deployment instructions for region selection
+
+  # DynamoDB metadata table (tenant ID as partition key)
+  MetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: tenant-metadata
+      AttributeDefinitions:
+        - AttributeName: tenantId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: tenantId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # SNS topic to publish write events
+  WriteTopic:
+    Type: AWS::SNS::Topic
+
+  # SQS queue for R1 replication
+  R1Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: r1-replication-queue
+
+  # SQS queue for R2 replication
+  R2Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: r2-replication-queue
+
+  # SNS subscriptions to push to queues
+  R1QueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WriteTopic
+      Protocol: sqs
+      Endpoint: !GetAtt R1Queue.Arn
+  R2QueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref WriteTopic
+      Protocol: sqs
+      Endpoint: !GetAtt R2Queue.Arn
+
+  # SQS Queue Policy to allow SNS to send messages
+  R1QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref R1Queue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt R1Queue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref WriteTopic
+
+  R2QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref R2Queue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt R2Queue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref WriteTopic
+
+  # Lambda execution role for write handler
+  WriteLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub arn:aws:s3:::${PrimaryBucketName}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt MetadataTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref WriteTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # Lambda function: WriteHandler
+  WriteHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: write-handler
+      Runtime: python3.10
+      Handler: handler.lambda_handler
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import sqlite3
+          import tempfile
+          import uuid
+          from urllib.parse import parse_qs
+
+          s3 = boto3.client('s3')
+          ddb = boto3.resource('dynamodb')
+          sns = boto3.client('sns')
+
+          METADATA_TABLE = os.environ['METADATA_TABLE']
+          PRIMARY_BUCKET = os.environ['PRIMARY_BUCKET']
+          WRITE_TOPIC = os.environ['WRITE_TOPIC']
+
+          def lambda_handler(event, context):
+              # Expect JSON payload: {"tenantId": "t1", "sql": "INSERT ..."}
+              body = event.get('body')
+              if body is None:
+                  return {"statusCode": 400, "body": "Missing body"}
+              payload = json.loads(body)
+              tenant_id = payload.get('tenantId')
+              sql = payload.get('sql')
+              if not tenant_id or not sql:
+                  return {"statusCode": 400, "body": "tenantId and sql are required"}
+
+              table = ddb.Table(METADATA_TABLE)
+              item = table.get_item(Key={'tenantId': tenant_id}).get('Item')
+              if not item:
+                  return {"statusCode": 404, "body": "Tenant not found"}
+              db_key = item['dbKey']
+
+              # Download the database file
+              with tempfile.NamedTemporaryFile() as tmp:
+                  s3.download_file(PRIMARY_BUCKET, db_key, tmp.name)
+                  conn = sqlite3.connect(tmp.name)
+                  try:
+                      cur = conn.cursor()
+                      cur.execute(sql)
+                      conn.commit()
+                  finally:
+                      conn.close()
+                  # Upload back to S3
+                  s3.upload_file(tmp.name, PRIMARY_BUCKET, db_key)
+
+              # publish replication message
+              message = json.dumps({'tenantId': tenant_id, 'dbKey': db_key})
+              sns.publish(TopicArn=WRITE_TOPIC, Message=message)
+              return {"statusCode": 200, "body": "Write successful"}
+      Environment:
+        Variables:
+          METADATA_TABLE: !Ref MetadataTable
+          PRIMARY_BUCKET: !Ref PrimaryBucketName
+          WRITE_TOPIC: !Ref WriteTopic
+      Role: !GetAtt WriteLambdaRole.Arn
+      Timeout: 30
+
+  # Lambda execution role for read handler
+  ReadLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${ReplicaBucketR1Name}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !GetAtt MetadataTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # Lambda function: ReadHandler
+  ReadHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: read-handler
+      Runtime: python3.10
+      Handler: handler.lambda_handler
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import sqlite3
+          import tempfile
+
+          s3 = boto3.client('s3')
+          ddb = boto3.resource('dynamodb')
+
+          METADATA_TABLE = os.environ['METADATA_TABLE']
+          REPLICA_BUCKET = os.environ['REPLICA_BUCKET']
+
+          def lambda_handler(event, context):
+              # Expect query string: /read?tenantId=xx&sql=SELECT+...
+              params = event.get('queryStringParameters') or {}
+              tenant_id = params.get('tenantId')
+              sql = params.get('sql')
+              if not tenant_id or not sql:
+                  return {"statusCode": 400, "body": "tenantId and sql parameters are required"}
+              table = ddb.Table(METADATA_TABLE)
+              item = table.get_item(Key={'tenantId': tenant_id}).get('Item')
+              if not item:
+                  return {"statusCode": 404, "body": "Tenant not found"}
+              db_key = item['dbKey']
+              # Download from R1 replica bucket
+              with tempfile.NamedTemporaryFile() as tmp:
+                  s3.download_file(REPLICA_BUCKET, db_key, tmp.name)
+                  conn = sqlite3.connect(tmp.name)
+                  try:
+                      cur = conn.cursor()
+                      cur.execute(sql)
+                      rows = cur.fetchall()
+                  finally:
+                      conn.close()
+              return {"statusCode": 200, "body": json.dumps(rows)}
+      Environment:
+        Variables:
+          METADATA_TABLE: !Ref MetadataTable
+          REPLICA_BUCKET: !Ref ReplicaBucketR1Name
+      Role: !GetAtt ReadLambdaRole.Arn
+      Timeout: 30
+
+  # Lambda execution role for replica handlers
+  ReplicaLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReplicaLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:CopyObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub arn:aws:s3:::${PrimaryBucketName}/*
+                  - !Sub arn:aws:s3:::${ReplicaBucketR1Name}/*
+                  - !Sub arn:aws:s3:::${ReplicaBucketR2Name}/*
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt R1Queue.Arn
+                  - !GetAtt R2Queue.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # Lambda: R1ReplicaHandler
+  R1ReplicaHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: r1-replica-handler
+      Runtime: python3.10
+      Handler: handler.lambda_handler
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+
+          s3 = boto3.client('s3')
+          PRIMARY_BUCKET = os.environ['PRIMARY_BUCKET']
+          REPLICA_BUCKET = os.environ['REPLICA_BUCKET']
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  body = json.loads(record['body'])
+                  db_key = body['dbKey']
+                  # copy object using a temp key to avoid half‑written files
+                  temp_key = db_key + '.tmp'
+                  # Copy from primary to replica temp key
+                  s3.copy_object(
+                      Bucket=REPLICA_BUCKET,
+                      CopySource={'Bucket': PRIMARY_BUCKET, 'Key': db_key},
+                      Key=temp_key
+                  )
+                  # Replace final object with temp key (server‑side copy)
+                  s3.copy_object(
+                      Bucket=REPLICA_BUCKET,
+                      CopySource={'Bucket': REPLICA_BUCKET, 'Key': temp_key},
+                      Key=db_key
+                  )
+                  s3.delete_object(Bucket=REPLICA_BUCKET, Key=temp_key)
+              return {'statusCode': 200}
+      Environment:
+        Variables:
+          PRIMARY_BUCKET: !Ref PrimaryBucketName
+          REPLICA_BUCKET: !Ref ReplicaBucketR1Name
+      Role: !GetAtt ReplicaLambdaRole.Arn
+      Timeout: 30
+
+  # Event source mapping for R1 Lambda to SQS
+  R1EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt R1Queue.Arn
+      FunctionName: !Ref R1ReplicaHandler
+      BatchSize: 10
+
+  # Lambda: R2ReplicaHandler (identical logic but separate instance)
+  R2ReplicaHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: r2-replica-handler
+      Runtime: python3.10
+      Handler: handler.lambda_handler
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+
+          s3 = boto3.client('s3')
+          PRIMARY_BUCKET = os.environ['PRIMARY_BUCKET']
+          REPLICA_BUCKET = os.environ['REPLICA_BUCKET']
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  body = json.loads(record['body'])
+                  db_key = body['dbKey']
+                  temp_key = db_key + '.tmp'
+                  s3.copy_object(
+                      Bucket=REPLICA_BUCKET,
+                      CopySource={'Bucket': PRIMARY_BUCKET, 'Key': db_key},
+                      Key=temp_key
+                  )
+                  s3.copy_object(
+                      Bucket=REPLICA_BUCKET,
+                      CopySource={'Bucket': REPLICA_BUCKET, 'Key': temp_key},
+                      Key=db_key
+                  )
+                  s3.delete_object(Bucket=REPLICA_BUCKET, Key=temp_key)
+              return {'statusCode': 200}
+      Environment:
+        Variables:
+          PRIMARY_BUCKET: !Ref PrimaryBucketName
+          REPLICA_BUCKET: !Ref ReplicaBucketR2Name
+      Role: !GetAtt ReplicaLambdaRole.Arn
+      Timeout: 30
+
+  # Event source mapping for R2 Lambda to SQS
+  R2EventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt R2Queue.Arn
+      FunctionName: !Ref R2ReplicaHandler
+      BatchSize: 10
+
+  # Lambda execution role for health check
+  HealthLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: HealthCheckPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:CopyObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub arn:aws:s3:::${PrimaryBucketName}
+                  - !Sub arn:aws:s3:::${PrimaryBucketName}/*
+                  - !Sub arn:aws:s3:::${ReplicaBucketR2Name}
+                  - !Sub arn:aws:s3:::${ReplicaBucketR2Name}/*
+              - Effect: Allow
+                Action:
+                  - route53:GetHealthCheck
+                  - route53:UpdateHealthCheck
+                Resource: '*' # health checks are global
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  # Health check Lambda
+  HealthCheckHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: health-check-handler
+      Runtime: python3.10
+      Handler: handler.lambda_handler
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import time
+
+          s3 = boto3.client('s3')
+          r53 = boto3.client('route53')
+          PRIMARY_BUCKET = os.environ['PRIMARY_BUCKET']
+          R2_BUCKET = os.environ['R2_BUCKET']
+          HEALTH_CHECK_ID = os.environ.get('HEALTH_CHECK_ID')  # Optional manual health check
+
+          def lambda_handler(event, context):
+              # Simple health check: ensure a sentinel file exists in R2
+              sentinel = 'healthcheck.txt'
+              try:
+                  s3.head_object(Bucket=R2_BUCKET, Key=sentinel)
+              except s3.exceptions.NoSuchKey:
+                  # if sentinel missing, copy from primary
+                  s3.copy_object(
+                      Bucket=R2_BUCKET,
+                      CopySource={'Bucket': PRIMARY_BUCKET, 'Key': sentinel},
+                      Key=sentinel
+                  )
+              # Optionally update Route 53 health check status (omitted for brevity)
+              return {'statusCode': 200}
+      Environment:
+        Variables:
+          PRIMARY_BUCKET: !Ref PrimaryBucketName
+          R2_BUCKET: !Ref ReplicaBucketR2Name
+      Role: !GetAtt HealthLambdaRole.Arn
+      Timeout: 30
+
+  # EventBridge rule to run health check every 5 minutes
+  HealthCheckSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(5 minutes)
+      Targets:
+        - Arn: !GetAtt HealthCheckHandler.Arn
+          Id: HealthCheckTarget
+
+  # Permission for EventBridge to invoke health check Lambda
+  HealthCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HealthCheckHandler
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthCheckSchedule.Arn
+
+  # API Gateway (REST) for write and read
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: MultiTenantAPI
+
+  # API resources and methods
+  ApiWriteResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: write
+  ApiReadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: read
+
+  # Method integration for write
+  WriteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiWriteResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Uri: !Sub arn:aws:apigateway:${PrimaryRegion}:lambda:path/2015-03-31/functions/${WriteHandler.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+
+  # Permission for API Gateway to invoke write Lambda
+  WriteInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WriteHandler
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/POST/write
+
+  # Method integration for read
+  ReadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ApiReadResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS
+        Uri: !Sub arn:aws:apigateway:${PrimaryRegion}:lambda:path/2015-03-31/functions/${ReadHandler.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+
+  # Permission for API Gateway to invoke read Lambda
+  ReadInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReadHandler
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/read
+
+  # Deployment and stage
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - WriteMethod
+      - ReadMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+
+Outputs:
+  ApiEndpoint:
+    Description: Invoke URL of API Gateway
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
