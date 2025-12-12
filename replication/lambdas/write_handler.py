@@ -15,7 +15,7 @@ sns = boto3.client('sns')
 TENANT_METADATA_TABLE = os.environ.get('TENANT_METADATA_TABLE', 'octodb-tenants')
 REPLICA_METADATA_TABLE = os.environ.get('REPLICA_METADATA_TABLE', 'tenant-metadata')
 TENANT_NAME_INDEX = os.environ.get('TENANT_NAME_INDEX', 'Tenant_Name_Index')
-SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
+SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', 'arn:aws:sns:us-east-1:666802050343:ReplicationStack-WriteTopic-wyk88ACy3a2i')
 
 
 def lambda_handler(event, context):
@@ -289,3 +289,12 @@ def create_response(status_code, body):
         },
         'body': json.dumps(body)
     }
+
+    '''
+    Sample request body:
+    {
+        "tenant_name": "Tandon",
+        "api_key": "sk_live_PAC_x0LUbWVUZLzUeBitoTsDbt83bQSNmqf3uaTx-Yo",
+        "sql_query": "INSERT INTO Users (id, username, email, password, user_type, created_at, updated_at) VALUES ('usr10', 'john_doe12', 'john.doe12@email.com', 'hashed_passd_123', 'customer', '2025-01-10 08:30:00', '2025-01-10 08:30:00');"
+    } 
+    '''
