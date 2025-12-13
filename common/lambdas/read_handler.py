@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 from datetime import datetime
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 s3 = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
@@ -14,9 +15,8 @@ TENANT_METADATA_TABLE = os.environ.get('TENANT_METADATA_TABLE', 'octodb-tenants'
 REPLICA_METADATA_TABLE = os.environ.get('REPLICA_METADATA_TABLE', 'tenant-metadata')
 TENANT_NAME_INDEX = os.environ.get('TENANT_NAME_INDEX', 'Tenant_Name_Index')
 
-# Optional env vars for AccessTenant / hot cold logic
 EFS_MOUNT_DIR = os.environ.get('EFS_MOUNT_DIR', '/mnt/efs')
-REHYDRATION_FUNCTION_NAME = os.environ.get('REHYDRATION_FUNCTION_NAME')
+REHYDRATION_FUNCTION_NAME = os.environ.get('REHYDRATION_FUNCTION_NAME', None)
 
 
 def lambda_handler(event, context):
@@ -43,7 +43,7 @@ def lambda_handler(event, context):
                 'error': 'Missing required fields. Please provide tenant_name, api_key, and sql_query'
             })
 
-        # Step 1: tenant lookup and API key validation
+        # 1. Look up tenant metadata
         tenant_table = dynamodb.Table(TENANT_METADATA_TABLE)
 
         try:
@@ -57,30 +57,23 @@ def lambda_handler(event, context):
             })
 
         if not response.get('Items'):
-            return create_response(404, {
-                'error': f'Tenant "{tenant_name}" not found'
-            })
+            return create_response(404, {'error': f'Tenant "{tenant_name}" not found'})
 
         tenant_item = response['Items'][0]
 
+        # Validate API key
         if tenant_item.get('api_key') != api_key:
-            return create_response(401, {
-                'error': 'Invalid API key'
-            })
+            return create_response(401, {'error': 'Invalid API key'})
 
         tenant_id = tenant_item.get('tenant_id')
         if not tenant_id:
-            return create_response(500, {
-                'error': 'Tenant ID not found in metadata'
-            })
+            return create_response(500, {'error': 'Tenant ID not found in metadata'})
 
-        # Step 2: replica metadata (read only replica)
+        # 2. Get replica metadata
         replica_table = dynamodb.Table(REPLICA_METADATA_TABLE)
 
         try:
-            replica_response = replica_table.get_item(
-                Key={'tenantId': tenant_id}
-            )
+            replica_response = replica_table.get_item(Key={'tenantId': tenant_id})
         except Exception as e:
             return create_response(500, {
                 'error': f'Failed to query replica metadata: {str(e)}'
@@ -92,6 +85,7 @@ def lambda_handler(event, context):
             })
 
         replica_item = replica_response['Item']
+        primary_bucket = replica_item.get('primary_bucket')
         read_only_bucket = replica_item.get('read_only_bucket')
         db_path = replica_item.get('db_path')
 
@@ -100,61 +94,108 @@ def lambda_handler(event, context):
                 'error': 'Read-only bucket or database path not found in replica metadata'
             })
 
-        # AccessTenant: determine storage tier and update last_accessed_at
+        # 3. Hot cold metadata and last_accessed_at
         storage_tier = (tenant_item.get('storage_tier') or 'COLD').upper()
         db_key = tenant_item.get('current_db_path') or db_path
 
-        update_last_accessed(tenant_table, tenant_id)
+        # Update last_accessed_at for this tenant
+        try:
+            now_iso = datetime.utcnow().isoformat()
+            tenant_table.update_item(
+                Key={'tenant_id': tenant_id},
+                UpdateExpression='SET last_accessed_at = :ts',
+                ExpressionAttributeValues={':ts': now_iso}
+            )
+        except Exception as e:
+            # Do not fail read on telemetry error
+            print(f'WARNING: Failed to update last_accessed_at for tenant_id={tenant_id}: {e}')
 
-        use_efs = bool(
-            storage_tier == 'HOT' and
-            EFS_MOUNT_DIR and
-            db_key
-        )
+        # 4. Decide whether to use EFS, with rehydration for COLD tenants
+        efs_db_path = os.path.join(EFS_MOUNT_DIR, db_key) if (EFS_MOUNT_DIR and db_key) else None
+        db_source = None
 
-        efs_db_path = None
+        use_efs = bool(EFS_MOUNT_DIR and db_key)
+
         if use_efs:
-            # Hot copy lives under /mnt/efs/{db_key}
-            efs_db_path = os.path.join(EFS_MOUNT_DIR, db_key)
-            os.makedirs(os.path.dirname(efs_db_path), exist_ok=True)
-
+            # If EFS file does not exist, try to rehydrate, regardless of HOT or COLD tier
             if not os.path.exists(efs_db_path):
-                # Ask rehydration handler to populate EFS from the read replica
-                if REHYDRATION_FUNCTION_NAME:
+                if REHYDRATION_FUNCTION_NAME and primary_bucket:
                     try:
+                        print(
+                            f'Rehydration needed for tenant {tenant_id} in read-handler, calling {REHYDRATION_FUNCTION_NAME}')
                         invoke_rehydration(
                             tenant_id=tenant_id,
                             tenant_name=tenant_name,
-                            source_bucket=read_only_bucket,
+                            source_bucket=primary_bucket,
                             db_key=db_key,
                             target_path=efs_db_path,
-                            source_type='read_replica'
+                            source_type='primary'
                         )
+                        print(f'Rehydration completed for tenant {tenant_id} in read-handler')
                     except Exception as e:
-                        print(f'WARNING: Rehydration invocation failed for tenant {tenant_id}: {e}')
-                        use_efs = False
+                        print(f'WARNING: Rehydration invocation failed for tenant {tenant_id} in read-handler: {e}')
                 else:
-                    use_efs = False
+                    print('Rehydration disabled or primary bucket missing, skipping rehydration')
 
-        # Step 3: execute query, prefer EFS when available
-        if use_efs and efs_db_path and os.path.exists(efs_db_path):
-            # Hot path: use EFS directly
+            # After rehydration attempt, check again
+            if os.path.exists(efs_db_path):
+                db_source = 'EFS'
+            else:
+                use_efs = False
+
+        # 5. Execute query either on EFS (hot) or S3 read replica (cold)
+        if use_efs:
+            # Directly query DB on EFS
             try:
                 conn = sqlite3.connect(efs_db_path)
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
-
                 try:
                     cursor.execute(sql_query)
                     rows = cursor.fetchall()
                     result = [dict(row) for row in rows]
-
                     return create_response(200, {
                         'success': True,
                         'data': result,
                         'row_count': len(result),
                         'storage_tier': storage_tier,
-                        'db_source': 'EFS'
+                        'db_source': db_source or 'EFS'
+                    })
+                except sqlite3.Error as e:
+                    return create_response(400, {'error': f'SQL query execution failed: {str(e)}'})
+                finally:
+                    cursor.close()
+                    conn.close()
+            except Exception as e:
+                return create_response(500, {'error': f'Database connection error (EFS): {str(e)}'})
+
+        else:
+            # Fall back to S3 read replica (cold storage)
+            with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+                tmp_db_path = tmp_file.name
+
+            try:
+                print(f'Downloading database from S3 read replica: {read_only_bucket}/{db_path}')
+                s3.download_file(read_only_bucket, db_path, tmp_db_path)
+            except Exception as e:
+                return create_response(500, {
+                    'error': f'Failed to download database from S3 read replica: {str(e)}'
+                })
+
+            try:
+                conn = sqlite3.connect(tmp_db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(sql_query)
+                    rows = cursor.fetchall()
+                    result = [dict(row) for row in rows]
+                    return create_response(200, {
+                        'success': True,
+                        'data': result,
+                        'row_count': len(result),
+                        'storage_tier': storage_tier,
+                        'db_source': db_source or 'S3_READ_REPLICA'
                     })
                 except sqlite3.Error as e:
                     return create_response(400, {
@@ -165,88 +206,24 @@ def lambda_handler(event, context):
                     conn.close()
             except Exception as e:
                 return create_response(500, {
-                    'error': f'Database connection error (EFS): {str(e)}'
+                    'error': f'Database connection error (S3 replica): {str(e)}'
                 })
-        else:
-            # Cold path: existing behavior using S3 read replica
-            with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-                tmp_db_path = tmp_file.name
-
-            try:
+            finally:
                 try:
-                    s3.download_file(read_only_bucket, db_path, tmp_db_path)
-                except Exception as e:
-                    return create_response(500, {
-                        'error': f'Failed to download database from S3: {str(e)}'
-                    })
-
-                try:
-                    conn = sqlite3.connect(tmp_db_path)
-                    conn.row_factory = sqlite3.Row
-                    cursor = conn.cursor()
-
-                    try:
-                        cursor.execute(sql_query)
-                        rows = cursor.fetchall()
-                        result = [dict(row) for row in rows]
-
-                        return create_response(200, {
-                            'success': True,
-                            'data': result,
-                            'row_count': len(result),
-                            'storage_tier': storage_tier,
-                            'db_source': 'S3_READ_REPLICA'
-                        })
-                    except sqlite3.Error as e:
-                        return create_response(400, {
-                            'error': f'SQL query execution failed: {str(e)}'
-                        })
-                    finally:
-                        cursor.close()
-                        conn.close()
-                except Exception as e:
-                    return create_response(500, {
-                        'error': f'Database connection error: {str(e)}'
-                    })
-                finally:
-                    try:
-                        os.unlink(tmp_db_path)
-                    except OSError:
-                        pass
-            except Exception as e:
-                return create_response(500, {
-                    'error': f'Unexpected error during DB processing: {str(e)}'
-                })
+                    os.unlink(tmp_db_path)
+                except Exception:
+                    pass
 
     except json.JSONDecodeError:
-        return create_response(400, {
-            'error': 'Invalid JSON in request body'
-        })
+        return create_response(400, {'error': 'Invalid JSON in request body'})
     except Exception as e:
-        return create_response(500, {
-            'error': f'Unexpected error: {str(e)}'
-        })
-
-
-def update_last_accessed(tenant_table, tenant_id):
-    try:
-        now = datetime.utcnow().isoformat()
-        tenant_table.update_item(
-            Key={'tenant_id': tenant_id},
-            UpdateExpression='SET last_accessed_at = :ts',
-            ExpressionAttributeValues={':ts': now}
-        )
-    except Exception as e:
-        print(f'WARNING: Failed to update last_accessed_at for tenant {tenant_id}: {e}')
+        return create_response(500, {'error': f'Unexpected error: {str(e)}'})
 
 
 def invoke_rehydration(tenant_id, tenant_name, source_bucket, db_key, target_path, source_type):
-    """
-    Helper that calls the rehydration Lambda synchronously.
-    The rehydration-handler will be implemented separately.
-    """
+    """Invoke the rehydration Lambda synchronously."""
     if not REHYDRATION_FUNCTION_NAME:
-        raise RuntimeError('REHYDRATION_FUNCTION_NAME is not configured')
+        raise RuntimeError('REHYDRATION_FUNCTION_NAME is not set')
 
     payload = {
         'tenant_id': tenant_id,
