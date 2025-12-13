@@ -1,0 +1,900 @@
+import json
+import boto3
+import uuid
+import hashlib
+from datetime import datetime
+
+# Initialize AWS clients
+dynamodb = boto3.resource('dynamodb')
+
+# Configuration
+TENANTS_TABLE = dynamodb.Table('octodb-tenants')
+API_USERS_TABLE = dynamodb.Table('octodb-users')
+
+def lambda_handler(event, context):
+    """
+    Lambda function to handle CRUD operations for API users (organizational access).
+    
+    These are users who have access to manage the tenant's database via API.
+    NOT end users stored in SQLite.
+    
+    Requires x-api-key header for authentication.
+    
+    Supported operations:
+    - POST /tenants/{tenant_id}/users - Create API user
+    - GET /tenants/{tenant_id}/users/{user_id} - Get API user
+    - PUT /tenants/{tenant_id}/users/{user_id} - Update API user
+    - DELETE /tenants/{tenant_id}/users/{user_id} - Delete API user
+    - GET /tenants/{tenant_id}/users - List all API users for tenant
+    """
+    
+    try:
+        # Parse request
+        http_method = event.get('httpMethod')
+        path_params = event.get('pathParameters', {})
+        headers = event.get('headers', {})
+        
+        tenant_id = path_params.get('id') or path_params.get('tenant_id')
+        user_id = path_params.get('user_id')
+        body = json.loads(event.get('body', '{}'))
+        
+        # Get API key from headers (case-insensitive)
+        api_key = None
+        for header_name, header_value in headers.items():
+            if header_name.lower() == 'x-api-key':
+                api_key = header_value
+                break
+        
+        print(f"Method: {http_method}, Tenant: {tenant_id}, User: {user_id}")
+        print(f"API Key Present: {api_key is not None}")
+        
+        # Validate tenant_id
+        if not tenant_id:
+            return error_response(400, 'Missing tenant_id in path')
+        
+        # Validate API key and get tenant
+        tenant_data = validate_api_key(tenant_id, api_key)
+        if 'error' in tenant_data:
+            return tenant_data  # Return error response
+        
+        print(f"API key validated for tenant: {tenant_id}")
+        
+        # Route to appropriate handler
+        if http_method == 'POST':
+            return create_api_user(tenant_id, body)
+        elif http_method == 'GET' and not user_id:
+            return list_api_users(tenant_id)
+        elif http_method == 'GET' and user_id:
+            return get_api_user(tenant_id, user_id)
+        elif http_method == 'PUT' and user_id:
+            return update_api_user(tenant_id, user_id, body)
+        elif http_method == 'DELETE' and user_id:
+            return delete_api_user(tenant_id, user_id)
+        else:
+            return error_response(405, f'Method {http_method} not allowed')
+        
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return error_response(500, f'Internal server error: {str(e)}')
+
+
+def validate_api_key(tenant_id, api_key):
+    """Validate API key belongs to tenant"""
+    if not api_key:
+        return error_response(401, 'Missing x-api-key header')
+    
+    try:
+        tenant_response = TENANTS_TABLE.get_item(Key={'tenant_id': tenant_id})
+        
+        if 'Item' not in tenant_response:
+            return error_response(404, f'Tenant {tenant_id} not found')
+        
+        tenant_data = tenant_response['Item']
+        
+        if api_key != tenant_data.get('api_key'):
+            return error_response(403, 'Invalid API key for this tenant')
+        
+        return tenant_data
+    except Exception as e:
+        return error_response(500, f'Validation error: {str(e)}')
+
+
+def hash_password(password):
+    """Hash password using SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def create_api_user(tenant_id, body):
+    """Create a new API user for the tenant"""
+    try:
+        email = body.get('email')
+        password = body.get('password')
+        role = body.get('role', 'developer')  # admin, developer, viewer
+        
+        if not email or not password:
+            return error_response(400, 'Missing required fields: email and password')
+        
+        # Validate role
+        valid_roles = ['admin', 'developer', 'viewer']
+        if role not in valid_roles:
+            return error_response(400, f'Invalid role. Must be one of: {", ".join(valid_roles)}')
+        
+        # Generate user ID
+        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        current_time = datetime.utcnow().isoformat() + 'Z'
+        
+        # Hash password
+        hashed_password = hash_password(password)
+        
+        # Check if email already exists for this tenant
+        existing_users = API_USERS_TABLE.query(
+            IndexName='tenant_id-index',
+            KeyConditionExpression='tenant_id = :tid',
+            FilterExpression='email = :email',
+            ExpressionAttributeValues={
+                ':tid': tenant_id,
+                ':email': email
+            }
+        )
+        
+        if existing_users.get('Items'):
+            return error_response(409, f'User with email {email} already exists for this tenant')
+        
+        # Create API user
+        API_USERS_TABLE.put_item(Item={
+            'user_id': user_id,
+            'tenant_id': tenant_id,
+            'email': email,
+            'password': hashed_password,
+            'role': role,
+            'created_at': current_time,
+            'updated_at': current_time
+        })
+        
+        print(f"Created API user: {user_id} for tenant: {tenant_id}")
+        
+        return {
+            'statusCode': 201,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'API user created successfully',
+                'user_id': user_id,
+                'email': email,
+                'role': role,
+                'tenant_id': tenant_id,
+                'created_at': current_time
+            })
+        }
+    except Exception as e:
+        print(f"Error creating user: {str(e)}")
+        return error_response(500, f'Failed to create user: {str(e)}')
+
+
+def list_api_users(tenant_id):
+    """List all API users for a tenant"""
+    try:
+        response = API_USERS_TABLE.query(
+            IndexName='tenant_id-index',
+            KeyConditionExpression='tenant_id = :tid',
+            ExpressionAttributeValues={':tid': tenant_id}
+        )
+        
+        users = response.get('Items', [])
+        
+        # Remove password hashes from response
+        for user in users:
+            user.pop('password', None)
+        
+        # Sort by created_at
+        users.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        
+        return {
+            'statusCode': 200,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'API users retrieved successfully',
+                'count': len(users),
+                'tenant_id': tenant_id,
+                'users': users
+            })
+        }
+    except Exception as e:
+        return error_response(500, f'Failed to list users: {str(e)}')
+
+
+def get_api_user(tenant_id, user_id):
+    """Get specific API user details"""
+    try:
+        response = API_USERS_TABLE.get_item(Key={'user_id': user_id})
+        
+        if 'Item' not in response:
+            return error_response(404, f'User {user_id} not found')
+        
+        user = response['Item']
+        
+        # Verify user belongs to this tenant
+        if user.get('tenant_id') != tenant_id:
+            return error_response(403, 'User does not belong to this tenant')
+        
+        # Remove password hash
+        user.pop('password', None)
+        
+        return {
+            'statusCode': 200,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'User retrieved successfully',
+                'user': user
+            })
+        }
+    except Exception as e:
+        return error_response(500, f'Failed to get user: {str(e)}')
+
+
+def update_api_user(tenant_id, user_id, body):
+    """Update API user information"""
+    try:
+        # Check if user exists and belongs to tenant
+        response = API_USERS_TABLE.get_item(Key={'user_id': user_id})
+        
+        if 'Item' not in response:
+            return error_response(404, f'User {user_id} not found')
+        
+        user = response['Item']
+        
+        if user.get('tenant_id') != tenant_id:
+            return error_response(403, 'User does not belong to this tenant')
+        
+        # Build update expression
+        update_expr = "SET "
+        expr_attr_values = {}
+        expr_attr_names = {}
+        
+        if 'email' in body:
+            update_expr += "email = :email, "
+            expr_attr_values[':email'] = body['email']
+        
+        if 'password' in body:
+            update_expr += "#pwd = :pwd, "
+            expr_attr_names['#pwd'] = 'password'
+            expr_attr_values[':pwd'] = hash_password(body['password'])
+        
+        if 'role' in body:
+            valid_roles = ['admin', 'developer', 'viewer']
+            if body['role'] not in valid_roles:
+                return error_response(400, f'Invalid role. Must be one of: {", ".join(valid_roles)}')
+            update_expr += "#role = :role, "
+            expr_attr_names['#role'] = 'role'
+            expr_attr_values[':role'] = body['role']
+        
+        if not expr_attr_values:
+            return error_response(400, 'No fields to update')
+        
+        # Add updated_at
+        update_expr += "updated_at = :ua"
+        expr_attr_values[':ua'] = datetime.utcnow().isoformat() + 'Z'
+        
+        # Perform update
+        update_kwargs = {
+            'Key': {'user_id': user_id},
+            'UpdateExpression': update_expr,
+            'ExpressionAttributeValues': expr_attr_values,
+            'ReturnValues': 'ALL_NEW'
+        }
+        
+        if expr_attr_names:
+            update_kwargs['ExpressionAttributeNames'] = expr_attr_names
+        
+        result = API_USERS_TABLE.update_item(**update_kwargs)
+        
+        # Remove password from response
+        updated_user = result['Attributes']
+        updated_user.pop('password', None)
+        
+        return {
+            'statusCode': 200,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'User updated successfully',
+                'user': updated_user
+            })
+        }
+    except Exception as e:
+        return error_response(500, f'Failed to update user: {str(e)}')
+
+
+def delete_api_user(tenant_id, user_id):
+    """Delete API user"""
+    try:
+        # Check if user exists and belongs to tenant
+        response = API_USERS_TABLE.get_item(Key={'user_id': user_id})
+        
+        if 'Item' not in response:
+            return error_response(404, f'User {user_id} not found')
+        
+        user = response['Item']
+        
+        if user.get('tenant_id') != tenant_id:
+            return error_response(403, 'User does not belong to this tenant')
+        
+        # Delete user
+        API_USERS_TABLE.delete_item(Key={'user_id': user_id})
+        
+        print(f"Deleted API user: {user_id} from tenant: {tenant_id}")
+        
+        return {
+            'statusCode': 200,
+            'headers': {'Content-Type': 'application/json'},
+            'body': json.dumps({
+                'message': 'User deleted successfully',
+                'user_id': user_id,
+                'tenant_id': tenant_id
+            })
+        }
+    except Exception as e:
+        return error_response(500, f'Failed to delete user: {str(e)}')
+
+
+def error_response(status_code, message):
+    """Helper function for error responses"""
+    return {
+        'statusCode': status_code,
+        'headers': {'Content-Type': 'application/json'},
+        'body': json.dumps({'error': message})
+    }
+
+
+# import json
+# import boto3
+# import sqlite3
+# import uuid
+# from datetime import datetime
+
+# # Initialize AWS clients
+# s3 = boto3.client('s3')
+# dynamodb = boto3.resource('dynamodb')
+
+# # Configuration
+# S3_BUCKET = 'octodb-tenants-bucket'
+# TENANTS_TABLE = dynamodb.Table('octodb-tenants')
+
+# def lambda_handler(event, context):
+#     """
+#     Lambda function to handle CRUD operations on tenant databases.
+    
+#     Supported operations:
+#     - POST /tenants/{tenant_id}/users - Create user
+#     - GET /tenants/{tenant_id}/users/{user_id} - Get user
+#     - PUT /tenants/{tenant_id}/users/{user_id} - Update user
+#     - DELETE /tenants/{tenant_id}/users/{user_id} - Delete user
+#     """
+    
+#     try:
+#         # Parse request
+#         http_method = event.get('httpMethod')
+#         path_params = event.get('pathParameters', {})
+#         headers = event.get('headers', {})
+        
+#         # Accept both 'id' and 'tenant_id' as path parameters
+#         tenant_id = path_params.get('id') or path_params.get('tenant_id')
+#         user_id = path_params.get('user_id')  # user_id from path (if present)
+#         body = json.loads(event.get('body', '{}'))
+        
+#         # Get API key from headers (case-insensitive)
+#         api_key = None
+#         for header_name, header_value in headers.items():
+#             if header_name.lower() == 'x-api-key':
+#                 api_key = header_value
+#                 break
+        
+#         print(f"Method: {http_method}, Tenant: {tenant_id}, User: {user_id}")
+#         print(f"Path params received: {path_params}, API Key Present: {api_key is not None}")
+        
+#         # Validate tenant_id
+#         if not tenant_id:
+#             return error_response(400, f'Missing tenant_id in path. Received params: {path_params}')
+        
+#         # Step 1: Query DynamoDB to get tenant and validate API key
+#         tenant_response = TENANTS_TABLE.get_item(Key={'tenant_id': tenant_id})
+        
+#         if 'Item' not in tenant_response:
+#             return error_response(404, f'Tenant {tenant_id} not found')
+        
+#         tenant_data = tenant_response['Item']
+        
+#         # Validate API key
+#         if not api_key:
+#             return error_response(401, 'Missing x-api-key header. Add header: x-api-key: YOUR_API_KEY')
+        
+#         if api_key != tenant_data.get('api_key'):
+#             return error_response(403, 'Invalid API key for this tenant')
+        
+#         print(f"API key validated successfully for tenant: {tenant_id}")
+        
+#         current_db_path = tenant_data['current_db_path']  # e.g., "databases/db_uuid.db"
+        
+#         print(f"Current DB path: {current_db_path}")
+        
+#         # Step 2: Download database from S3
+#         local_db_path = '/tmp/tenant.db'
+#         s3.download_file(S3_BUCKET, current_db_path, local_db_path)
+#         print(f"Downloaded database from S3")
+        
+#         # Step 3: Perform CRUD operation
+#         conn = sqlite3.connect(local_db_path)
+#         conn.row_factory = sqlite3.Row  # Return rows as dictionaries
+#         cursor = conn.cursor()
+        
+#         result = None
+        
+#         if http_method == 'POST':
+#             # Create user
+#             result = create_user(cursor, body)
+#         elif http_method == 'GET' and not user_id:
+#             # List all users (GET /tenants/{id}/users)
+#             result = list_users(cursor)
+#         elif http_method == 'GET' and user_id:
+#             # Get specific user (GET /tenants/{id}/users/{user_id})
+#             result = get_user(cursor, user_id)
+#         elif http_method == 'PUT':
+#             # Update user
+#             if not user_id:
+#                 return error_response(400, 'Missing user_id in path')
+#             result = update_user(cursor, user_id, body)
+#         elif http_method == 'DELETE':
+#             # Delete user
+#             if not user_id:
+#                 return error_response(400, 'Missing user_id in path')
+#             result = delete_user(cursor, user_id)
+#         else:
+#             conn.close()
+#             return error_response(405, f'Method {http_method} not allowed')
+        
+#         # Commit changes
+#         conn.commit()
+#         conn.close()
+        
+#         # Step 4: Upload modified database back to S3 (same path)
+#         s3.upload_file(local_db_path, S3_BUCKET, current_db_path)
+#         print(f"Uploaded modified database to S3")
+        
+#         # Step 5: Return result
+#         return {
+#             'statusCode': result['statusCode'],
+#             'headers': {'Content-Type': 'application/json'},
+#             'body': json.dumps(result['body'])
+#         }
+        
+#     except Exception as e:
+#         print(f"Error: {str(e)}")
+#         import traceback
+#         traceback.print_exc()
+        
+#         return error_response(500, f'Internal server error: {str(e)}')
+
+
+# def create_user(cursor, body):
+#     """Create a new user in the Users table"""
+#     username = body.get('username')
+#     email = body.get('email')
+#     password = body.get('password')
+    
+#     if not username or not email or not password:
+#         return {
+#             'statusCode': 400,
+#             'body': {'error': 'Missing required fields: username, email, password'}
+#         }
+    
+#     user_id = str(uuid.uuid4())
+#     current_time = datetime.utcnow().isoformat()
+    
+#     try:
+#         cursor.execute('''
+#             INSERT INTO Users (id, username, email, password, created_at, updated_at)
+#             VALUES (?, ?, ?, ?, ?, ?)
+#         ''', (user_id, username, email, password, current_time, current_time))
+        
+#         return {
+#             'statusCode': 201,
+#             'body': {
+#                 'message': 'User created successfully',
+#                 'user_id': user_id,
+#                 'username': username,
+#                 'email': email,
+#                 'created_at': current_time
+#             }
+#         }
+#     except sqlite3.IntegrityError as e:
+#         return {
+#             'statusCode': 409,
+#             'body': {'error': f'User already exists: {str(e)}'}
+#         }
+
+
+# def get_user(cursor, user_id):
+#     """Get a user by ID"""
+#     cursor.execute('SELECT * FROM Users WHERE id = ?', (user_id,))
+#     row = cursor.fetchone()
+    
+#     if not row:
+#         return {
+#             'statusCode': 404,
+#             'body': {'error': f'User {user_id} not found'}
+#         }
+    
+#     user = dict(row)
+#     # Remove password from response
+#     user.pop('password', None)
+    
+#     return {
+#         'statusCode': 200,
+#         'body': {
+#             'message': 'User retrieved successfully',
+#             'user': user
+#         }
+#     }
+
+
+# def list_users(cursor):
+#     """List all users in the tenant database"""
+#     cursor.execute('SELECT * FROM Users ORDER BY created_at DESC')
+#     rows = cursor.fetchall()
+    
+#     users = []
+#     for row in rows:
+#         user = dict(row)
+#         # Remove password from response
+#         user.pop('password', None)
+#         users.append(user)
+    
+#     return {
+#         'statusCode': 200,
+#         'body': {
+#             'message': 'Users retrieved successfully',
+#             'count': len(users),
+#             'users': users
+#         }
+#     }
+
+
+# def update_user(cursor, user_id, body):
+#     """Update a user"""
+#     # Check if user exists
+#     cursor.execute('SELECT id FROM Users WHERE id = ?', (user_id,))
+#     if not cursor.fetchone():
+#         return {
+#             'statusCode': 404,
+#             'body': {'error': f'User {user_id} not found'}
+#         }
+    
+#     # Build dynamic update query
+#     update_fields = []
+#     values = []
+    
+#     if 'username' in body:
+#         update_fields.append('username = ?')
+#         values.append(body['username'])
+#     if 'email' in body:
+#         update_fields.append('email = ?')
+#         values.append(body['email'])
+#     if 'password' in body:
+#         update_fields.append('password = ?')
+#         values.append(body['password'])
+    
+#     if not update_fields:
+#         return {
+#             'statusCode': 400,
+#             'body': {'error': 'No fields to update'}
+#         }
+    
+#     # Add updated_at
+#     update_fields.append('updated_at = ?')
+#     values.append(datetime.utcnow().isoformat())
+    
+#     # Add user_id for WHERE clause
+#     values.append(user_id)
+    
+#     query = f"UPDATE Users SET {', '.join(update_fields)} WHERE id = ?"
+    
+#     try:
+#         cursor.execute(query, values)
+        
+#         return {
+#             'statusCode': 200,
+#             'body': {
+#                 'message': 'User updated successfully',
+#                 'user_id': user_id
+#             }
+#         }
+#     except sqlite3.IntegrityError as e:
+#         return {
+#             'statusCode': 409,
+#             'body': {'error': f'Update failed: {str(e)}'}
+#         }
+
+
+# def delete_user(cursor, user_id):
+#     """Delete a user"""
+#     # Check if user exists
+#     cursor.execute('SELECT id FROM Users WHERE id = ?', (user_id,))
+#     if not cursor.fetchone():
+#         return {
+#             'statusCode': 404,
+#             'body': {'error': f'User {user_id} not found'}
+#         }
+    
+#     cursor.execute('DELETE FROM Users WHERE id = ?', (user_id,))
+    
+#     return {
+#         'statusCode': 200,
+#         'body': {
+#             'message': 'User deleted successfully',
+#             'user_id': user_id
+#         }
+#     }
+
+
+# def error_response(status_code, message):
+#     """Helper function to create error responses"""
+#     return {
+#         'statusCode': status_code,
+#         'headers': {'Content-Type': 'application/json'},
+#         'body': json.dumps({'error': message})
+#     }
+
+
+# import json
+# import boto3
+# import sqlite3
+# import uuid
+# from datetime import datetime
+
+# # Initialize AWS clients
+# s3 = boto3.client('s3')
+# dynamodb = boto3.resource('dynamodb')
+
+# # Configuration
+# S3_BUCKET = 'octodb-tenants-bucket'
+# TENANTS_TABLE = dynamodb.Table('octodb-tenants')
+
+# def lambda_handler(event, context):
+#     """
+#     Lambda function to handle CRUD operations on tenant databases.
+    
+#     Supported operations:
+#     - POST /tenants/{tenant_id}/users - Create user
+#     - GET /tenants/{tenant_id}/users/{user_id} - Get user
+#     - PUT /tenants/{tenant_id}/users/{user_id} - Update user
+#     - DELETE /tenants/{tenant_id}/users/{user_id} - Delete user
+#     """
+    
+#     try:
+#         # Parse request
+#         http_method = event.get('httpMethod')
+#         path_params = event.get('pathParameters', {})
+#         tenant_id = path_params.get('tenant_id')  # tenant_id from path
+#         user_id = path_params.get('user_id')  # user_id from path (if present)
+#         body = json.loads(event.get('body', '{}'))
+        
+#         print(f"Method: {http_method}, Tenant: {tenant_id}, User: {user_id}")
+        
+#         # Validate tenant_id
+#         if not tenant_id:
+#             return error_response(400, 'Missing tenant_id in path')
+        
+#         # Step 1: Query DynamoDB to get current database path
+#         tenant_response = TENANTS_TABLE.get_item(Key={'tenant_id': tenant_id})
+        
+#         if 'Item' not in tenant_response:
+#             return error_response(404, f'Tenant {tenant_id} not found')
+        
+#         tenant_data = tenant_response['Item']
+#         current_db_path = tenant_data['current_db_path']  # e.g., "databases/db_uuid.db"
+        
+#         print(f"Current DB path: {current_db_path}")
+        
+#         # Step 2: Download database from S3
+#         local_db_path = '/tmp/tenant.db'
+#         s3.download_file(S3_BUCKET, current_db_path, local_db_path)
+#         print(f"Downloaded database from S3")
+        
+#         # Step 3: Perform CRUD operation
+#         conn = sqlite3.connect(local_db_path)
+#         conn.row_factory = sqlite3.Row  # Return rows as dictionaries
+#         cursor = conn.cursor()
+        
+#         result = None
+        
+#         if http_method == 'POST':
+#             # Create user
+#             result = create_user(cursor, body)
+#         elif http_method == 'GET':
+#             # Get user
+#             if not user_id:
+#                 return error_response(400, 'Missing user_id in path')
+#             result = get_user(cursor, user_id)
+#         elif http_method == 'PUT':
+#             # Update user
+#             if not user_id:
+#                 return error_response(400, 'Missing user_id in path')
+#             result = update_user(cursor, user_id, body)
+#         elif http_method == 'DELETE':
+#             # Delete user
+#             if not user_id:
+#                 return error_response(400, 'Missing user_id in path')
+#             result = delete_user(cursor, user_id)
+#         else:
+#             conn.close()
+#             return error_response(405, f'Method {http_method} not allowed')
+        
+#         # Commit changes
+#         conn.commit()
+#         conn.close()
+        
+#         # Step 4: Upload modified database back to S3 (same path)
+#         s3.upload_file(local_db_path, S3_BUCKET, current_db_path)
+#         print(f"Uploaded modified database to S3")
+        
+#         # Step 5: Return result
+#         return {
+#             'statusCode': result['statusCode'],
+#             'headers': {'Content-Type': 'application/json'},
+#             'body': json.dumps(result['body'])
+#         }
+        
+#     except Exception as e:
+#         print(f"Error: {str(e)}")
+#         import traceback
+#         traceback.print_exc()
+        
+#         return error_response(500, f'Internal server error: {str(e)}')
+
+
+# def create_user(cursor, body):
+#     """Create a new user in the Users table"""
+#     username = body.get('username')
+#     email = body.get('email')
+#     password = body.get('password')
+    
+#     if not username or not email or not password:
+#         return {
+#             'statusCode': 400,
+#             'body': {'error': 'Missing required fields: username, email, password'}
+#         }
+    
+#     user_id = str(uuid.uuid4())
+#     current_time = datetime.utcnow().isoformat()
+    
+#     try:
+#         cursor.execute('''
+#             INSERT INTO Users (id, username, email, password, created_at, updated_at)
+#             VALUES (?, ?, ?, ?, ?, ?)
+#         ''', (user_id, username, email, password, current_time, current_time))
+        
+#         return {
+#             'statusCode': 201,
+#             'body': {
+#                 'message': 'User created successfully',
+#                 'user_id': user_id,
+#                 'username': username,
+#                 'email': email,
+#                 'created_at': current_time
+#             }
+#         }
+#     except sqlite3.IntegrityError as e:
+#         return {
+#             'statusCode': 409,
+#             'body': {'error': f'User already exists: {str(e)}'}
+#         }
+
+
+# def get_user(cursor, user_id):
+#     """Get a user by ID"""
+#     cursor.execute('SELECT * FROM Users WHERE id = ?', (user_id,))
+#     row = cursor.fetchone()
+    
+#     if not row:
+#         return {
+#             'statusCode': 404,
+#             'body': {'error': f'User {user_id} not found'}
+#         }
+    
+#     user = dict(row)
+#     # Remove password from response
+#     user.pop('password', None)
+    
+#     return {
+#         'statusCode': 200,
+#         'body': {
+#             'message': 'User retrieved successfully',
+#             'user': user
+#         }
+#     }
+
+
+# def update_user(cursor, user_id, body):
+#     """Update a user"""
+#     # Check if user exists
+#     cursor.execute('SELECT id FROM Users WHERE id = ?', (user_id,))
+#     if not cursor.fetchone():
+#         return {
+#             'statusCode': 404,
+#             'body': {'error': f'User {user_id} not found'}
+#         }
+    
+#     # Build dynamic update query
+#     update_fields = []
+#     values = []
+    
+#     if 'username' in body:
+#         update_fields.append('username = ?')
+#         values.append(body['username'])
+#     if 'email' in body:
+#         update_fields.append('email = ?')
+#         values.append(body['email'])
+#     if 'password' in body:
+#         update_fields.append('password = ?')
+#         values.append(body['password'])
+    
+#     if not update_fields:
+#         return {
+#             'statusCode': 400,
+#             'body': {'error': 'No fields to update'}
+#         }
+    
+#     # Add updated_at
+#     update_fields.append('updated_at = ?')
+#     values.append(datetime.utcnow().isoformat())
+    
+#     # Add user_id for WHERE clause
+#     values.append(user_id)
+    
+#     query = f"UPDATE Users SET {', '.join(update_fields)} WHERE id = ?"
+    
+#     try:
+#         cursor.execute(query, values)
+        
+#         return {
+#             'statusCode': 200,
+#             'body': {
+#                 'message': 'User updated successfully',
+#                 'user_id': user_id
+#             }
+#         }
+#     except sqlite3.IntegrityError as e:
+#         return {
+#             'statusCode': 409,
+#             'body': {'error': f'Update failed: {str(e)}'}
+#         }
+
+
+# def delete_user(cursor, user_id):
+#     """Delete a user"""
+#     # Check if user exists
+#     cursor.execute('SELECT id FROM Users WHERE id = ?', (user_id,))
+#     if not cursor.fetchone():
+#         return {
+#             'statusCode': 404,
+#             'body': {'error': f'User {user_id} not found'}
+#         }
+    
+#     cursor.execute('DELETE FROM Users WHERE id = ?', (user_id,))
+    
+#     return {
+#         'statusCode': 200,
+#         'body': {
+#             'message': 'User deleted successfully',
+#             'user_id': user_id
+#         }
+#     }
+
+
+# def error_response(status_code, message):
+#     """Helper function to create error responses"""
+#     return {
+#         'statusCode': status_code,
+#         'headers': {'Content-Type': 'application/json'},
+#         'body': json.dumps({'error': message})
+#     }
