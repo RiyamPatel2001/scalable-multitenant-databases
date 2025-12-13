@@ -135,6 +135,7 @@ def lambda_handler(event, context):
             if not os.path.exists(efs_db_path):
                 if REHYDRATION_FUNCTION_NAME:
                     try:
+                        print(f'Rehydration needed for tenant {tenant_id}, calling {REHYDRATION_FUNCTION_NAME}')
                         invoke_rehydration(
                             tenant_id=tenant_id,
                             tenant_name=tenant_name,
@@ -143,10 +144,12 @@ def lambda_handler(event, context):
                             target_path=efs_db_path,
                             source_type='primary'
                         )
+                        print(f'Rehydration completed for tenant {tenant_id}')
                     except Exception as e:
                         print(f'WARNING: Rehydration invocation failed for tenant {tenant_id}: {e}')
                         use_efs = False
                 else:
+                    print('REHYDRATION_FUNCTION_NAME not set, falling back to S3')
                     use_efs = False
 
         tmp_db_path = None
