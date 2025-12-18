@@ -69,7 +69,7 @@ def apply_ops_to_schema_sql(bucket, schema_s3_key, operations):
         try:
             for op in operations:
                 typ = op["op"]
-
+                print(f"Operation: {typ}")
                 if typ == "CREATE_TABLE":
                     sql = op.get("sql")
                     if not sql:
@@ -80,7 +80,7 @@ def apply_ops_to_schema_sql(bucket, schema_s3_key, operations):
                 elif typ == "DROP_TABLE":
                     table = op["table"]
                     conn.execute(f"DROP TABLE IF EXISTS {qident(table)};")
-                    conn.execute("COMMIT;")
+                    
 
                 elif typ == "RENAME_TABLE":
                     old_name = op["table"]
@@ -93,7 +93,7 @@ def apply_ops_to_schema_sql(bucket, schema_s3_key, operations):
                         # already renamed or conflict → for your project, treat as redundant
                         continue
                     conn.execute(f"ALTER TABLE {qident(old_name)} RENAME TO {qident(new_name)};")
-                    conn.execute("COMMIT;")
+                    
 
                 elif typ == "ADD_COLUMN":
                     table = op["table"]
@@ -117,35 +117,39 @@ def apply_ops_to_schema_sql(bucket, schema_s3_key, operations):
                     if default is not None:
                         sql += f" DEFAULT {sql_literal(default)}"
                     conn.execute(sql + ";")
-                    conn.execute("COMMIT;")
+                    
 
                 else:
                     raise ValueError(f"Unsupported op: {typ}")
 
+            if(operations[-1]["op"] != "CREATE_TABLE"):
+                conn.commit()
             
         except Exception:
+            conn.rollback()
             raise
 
         # Dump updated schema.
         new_sql = "\n".join(conn.iterdump()) + "\n"
 
         #Push new schema to s3
-        s3.put_object(Bucket=bucket, Key=schema_s3_key, Body=new_sql.encode("utf-8"))
+        s3.put_object(Bucket=bucket, Key=schema_s3_key, Body=new_sql.encode("utf-8")) 
 
         #Debug
-        print_schema_debug(new_sql)
+        # print_schema_debug(new_sql)
 
     finally:
         conn.close()
 
 
-def send_tenant_migration_job_to_sqs(id, schema_s3_key, tenant_s3_key, operations, dry_run=False):
+def send_tenant_migration_job_to_sqs(id, bucket, schema_s3_key, tenant_s3_key, operations, dry_run=False):
     migration_id = f"mig_{uuid.uuid4().hex[:12]}"
     requested_at = dt.datetime.now(dt.timezone.utc).isoformat()
 
     message_body = {
         "migrationId": migration_id,
         "requestedAt": requested_at,
+        "bucket": bucket,
         "schemaS3Key": schema_s3_key,
         "tenantS3Key": tenant_s3_key,
         "operations": operations
@@ -173,26 +177,62 @@ def send_tenant_migration_job_to_sqs(id, schema_s3_key, tenant_s3_key, operation
 
 def lambda_handler(event, context):
 
-
     scope = event["scope"]
     operations  = event["operations"]
 
     if(scope == "TENANT"):
-        tenant_id = event["tenantId"]
+        tenantName = event["tenantName"]
+
+        response_tenant = dynamodb.query(
+            TableName=TENANT_TABLE_NAME,
+            IndexName="Tenant_Name_Index",
+            KeyConditionExpression="tenant_name = :tname",
+            ExpressionAttributeValues={
+                ":tname": {"S": tenantName}
+            }
+        )
+
+        tenant_id = response_tenant["Items"][0]["tenant_id"]["S"] 
+
         response = dynamodb.get_item(TableName=TENANT_TABLE_NAME, Key={"tenant_id": {"S": tenant_id}})
-        
-        tenant_s3_path = response["Item"]["current_db_path"]
-        parent_schema = response["Item"]["parent_schema_ref"]
+
+        #Validate request
+        try:
+            if (event["apiKey"] != response["Item"]["api_key"]["S"]):
+                return {
+                    "statusCode": 401,
+                    "body": json.dumps({
+                        "message": "Unauthorized Access"
+                    }),
+                }
+        except:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({
+                    "message": "Tenant not found"
+                }),
+            }
+
+
+        tenant_s3_path = response["Item"]["current_db_path"]['S']
+
+        parent_schema = response["Item"]["parent_schema_ref"]['S']
 
         #Copy the schema and rename the new schema
         bucket = "octodb-tenants-bucket"
-        source_key = f"schemas/{parent_schema}"
+        read_only_replica_bucket = "scalable-db-read-only-replica-bucket"
+        standby_replica_bucket = "octodb-tenants-standby-bucket"
 
-        dest_key = f"schemas/{tenant_id}"
+
+        source_key = f"schemas/{parent_schema}.sql"
+
+        dest_key = f"schemas/{tenant_id}.sql"
         copy_source = {
             "Bucket": bucket,
             "Key": source_key
         }
+        print(copy_source)
+        print(dest_key)
 
         s3.copy_object(Bucket=bucket, CopySource=copy_source, Key=dest_key)
 
@@ -200,12 +240,52 @@ def lambda_handler(event, context):
         apply_ops_to_schema_sql(bucket, dest_key, operations)
 
 
+        #Copy the schema to standby replica bucket
+        standby_copy_source = {
+            "Bucket": bucket,
+            "Key": dest_key
+        }
+        s3.copy_object(Bucket=standby_replica_bucket, CopySource=standby_copy_source, Key=dest_key)
 
+        #Send tenant to migration SQS job
         out = send_tenant_migration_job_to_sqs(
             id=tenant_id,
+            bucket=bucket,
             schema_s3_key=dest_key,
             tenant_s3_key=tenant_s3_path,
             operations=operations,
+        )
+
+        #Send read-only replica to migration SQS job
+        out_read_only_replica = send_tenant_migration_job_to_sqs(
+            id=f"{tenant_id}-read-only-replica",
+            bucket=read_only_replica_bucket,
+            schema_s3_key=dest_key,
+            tenant_s3_key=tenant_s3_path,
+            operations=operations,
+        )
+
+        #Send standby replica to migration SQS job
+        out_standby_replica = send_tenant_migration_job_to_sqs(
+            id=f"{tenant_id}-standby-replica",
+            bucket=standby_replica_bucket,
+            schema_s3_key=dest_key,
+            tenant_s3_key=tenant_s3_path,
+            operations=operations,
+        )
+
+        #Add new schema to Dynamo
+        dynamodb.put_item(
+            TableName=SCHEMA_TABLE_NAME,
+            Item={
+                "schema_id": {"S": tenant_id},
+                "created_at": {"S": dt.datetime.now(dt.timezone.utc).isoformat()},
+                "created_by": {"S": "admin"},
+                "s3_path": {"S": dest_key},
+                "schema_name": {"S": tenant_id}, 
+                "schema_type": {"S": "TEMPLATE"},
+                "tenant_id": {"S": tenant_id}
+            }
         )
 
         #Update the parent_schema_ref
@@ -218,9 +298,41 @@ def lambda_handler(event, context):
 
 
     elif(scope == "TEMPLATE"):
-        schema_id = event["schemaId"]
+
+        schemaName = event["schemaName"]
+        response_schema = dynamodb.query(
+            TableName=SCHEMA_TABLE_NAME,
+            IndexName="schema_name_index",
+            KeyConditionExpression="schema_name = :sid",
+            ExpressionAttributeValues={
+                ":sid": {"S": schemaName}
+            }
+        )
+
+        schema_id = response_schema["Items"][0]["schema_id"]["S"]
         response_schema = dynamodb.get_item(TableName=SCHEMA_TABLE_NAME, Key={"schema_id": {"S": schema_id}})
-        schema_s3_path = response_schema["Item"]["s3_path"]['S']
+
+        # #Validate request
+        # try:
+        #     if (event["apiKey"] != response_schema["Item"]["api_key"]["S"]):
+        #         return {
+        #             "statusCode": 401,
+        #             "body": json.dumps({
+        #                 "message": "Unauthorized Access"
+        #             }),
+        #         }
+
+
+        try:
+            schema_s3_path = response_schema["Item"]["s3_path"]['S']
+        except:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({
+                    "message": "Schema not found"
+                }),
+            }
+
         #Check the tenant table for tenants with this schema id
         response_tenants = dynamodb.query(
             TableName=TENANT_TABLE_NAME,
@@ -230,12 +342,23 @@ def lambda_handler(event, context):
                 ":sid": {"S": schema_id}
             }
         )
+
         tenant_ids_with_given_schema = [item["tenant_id"]["S"] for item in response_tenants["Items"]]
         
         #Apply migration to the schema
         bucket = "octodb-tenants-bucket"
+        read_only_replica_bucket = "scalable-db-read-only-replica-bucket"
+        standby_replica_bucket = "octodb-tenants-standby-bucket"
+
+
         apply_ops_to_schema_sql(bucket, schema_s3_path, operations)
 
+        #Copy updated schema to standby replica bucket
+        standby_copy_source = {
+            "Bucket": bucket,
+            "Key": schema_s3_path
+        }
+        s3.copy_object(Bucket=standby_replica_bucket, CopySource=standby_copy_source, Key=schema_s3_path)
 
         for tenant_id in tenant_ids_with_given_schema:
 
@@ -244,14 +367,35 @@ def lambda_handler(event, context):
 
             out_tenant = send_tenant_migration_job_to_sqs(
                 id = f"{schema_id}:{tenant_id}",
+                bucket = bucket,
                 schema_s3_key = schema_s3_path,
                 tenant_s3_key = tenant_s3_path,
                 operations = operations,
             )
 
+            out_read_only_replica = send_tenant_migration_job_to_sqs(
+                id = f"{schema_id}:{tenant_id}-read-only-replica",
+                bucket = read_only_replica_bucket,
+                schema_s3_key = schema_s3_path,
+                tenant_s3_key = tenant_s3_path,
+                operations = operations,
+            )
+
+            out_standby_replica = send_tenant_migration_job_to_sqs(
+                id = f"{schema_id}:{tenant_id}-standby-replica",
+                bucket = standby_replica_bucket,
+                schema_s3_key = schema_s3_path,
+                tenant_s3_key = tenant_s3_path,
+                operations = operations,
+            )
 
     return {
         'statusCode': 202,
-        "headers": {"Content-Type": "application/json"},
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+            'Access-Control-Allow-Methods': 'POST,OPTIONS'
+        },
         'body': json.dumps("Processed Migration request")
     }
