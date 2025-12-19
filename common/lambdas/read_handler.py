@@ -1,3 +1,4 @@
+import re
 import os
 import json
 import boto3
@@ -17,6 +18,108 @@ TENANT_NAME_INDEX = os.environ.get('TENANT_NAME_INDEX', 'Tenant_Name_Index')
 
 EFS_MOUNT_DIR = os.environ.get('EFS_MOUNT_DIR', '/mnt/efs')
 REHYDRATION_FUNCTION_NAME = os.environ.get('REHYDRATION_FUNCTION_NAME', None)
+
+
+try:
+    import redis  # provided via Lambda Layer
+except Exception:
+    redis = None
+
+REDIS_ENABLED = os.environ.get("REDIS_ENABLED", "false").lower() == "true"
+REDIS_HOST = os.environ.get("REDIS_HOST")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_TLS = os.environ.get("REDIS_TLS", "false").lower() == "true"
+REDIS_AUTH_TOKEN = os.environ.get("REDIS_AUTH_TOKEN")
+REDIS_TTL_SECONDS = int(os.environ.get("REDIS_TTL_SECONDS", "30"))
+REDIS_CONNECT_TIMEOUT_MS = int(os.environ.get("REDIS_CONNECT_TIMEOUT_MS", "50"))
+REDIS_SOCKET_TIMEOUT_MS = int(os.environ.get("REDIS_SOCKET_TIMEOUT_MS", "50"))
+REDIS_MAX_VALUE_BYTES = int(os.environ.get("REDIS_MAX_VALUE_BYTES", str(256 * 1024)))
+
+_redis_client = None
+
+
+def _get_redis_client():
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    if not (REDIS_ENABLED and redis and REDIS_HOST):
+        _redis_client = None
+        return None
+    try:
+        kwargs = dict(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            socket_connect_timeout=REDIS_CONNECT_TIMEOUT_MS / 1000.0,
+            socket_timeout=REDIS_SOCKET_TIMEOUT_MS / 1000.0,
+            decode_responses=False,  # store bytes
+        )
+        if REDIS_TLS:
+            kwargs["ssl"] = True
+        if REDIS_AUTH_TOKEN:
+            kwargs["password"] = REDIS_AUTH_TOKEN
+        client = redis.Redis(**kwargs)
+        client.ping()
+        _redis_client = client
+        return client
+    except Exception as e:
+        print(f"WARNING: Redis disabled/unreachable: {e}")
+        _redis_client = None
+        return None
+
+
+def _is_cacheable_read(sql: str) -> bool:
+    if not sql:
+        return False
+    s = sql.strip().rstrip(";").lstrip()
+    low = s.lower()
+    return low.startswith("select") or low.startswith("with")
+
+
+def _normalize_sql(sql: str) -> str:
+    s = sql.strip().rstrip(";")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _tenant_ver_key(tenant_id: str) -> str:
+    return f"octodb:tenant:{tenant_id}:ver"
+
+
+def _cache_key(tenant_id: str, ver: int, sql: str) -> str:
+    import hashlib
+    h = hashlib.sha256(_normalize_sql(sql).encode("utf-8")).hexdigest()
+    return f"octodb:tenant:{tenant_id}:v{ver}:q:{h}"
+
+
+def _get_tenant_ver(client, tenant_id: str) -> int:
+    try:
+        raw = client.get(_tenant_ver_key(tenant_id))
+        if raw is None:
+            return 0
+        return int(raw.decode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _cache_get_json(client, key: str):
+    try:
+        raw = client.get(key)
+        if not raw:
+            return None
+        return json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        print(f"WARNING: Redis cache get failed: {e}")
+        return None
+
+
+def _cache_set_json(client, key: str, payload: dict, ttl: int):
+    try:
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        if len(data) > REDIS_MAX_VALUE_BYTES:
+            return
+        client.setex(key, ttl, data)
+    except Exception as e:
+        print(f"WARNING: Redis cache set failed: {e}")
 
 
 def lambda_handler(event, context):
@@ -113,6 +216,23 @@ def lambda_handler(event, context):
             # Do not fail read on telemetry error
             print(f'WARNING: Failed to update last_accessed_at for tenant_id={tenant_id}: {e}')
 
+        # ------------------------
+        # Redis read-through cache
+        # ------------------------
+        redis_client = _get_redis_client()
+        if redis_client and _is_cacheable_read(sql_query):
+            try:
+                ver = _get_tenant_ver(redis_client, tenant_id)
+                ck = _cache_key(tenant_id, ver, sql_query)
+                cached = _cache_get_json(redis_client, ck)
+                if cached is not None:
+                    cached.setdefault("storage_tier", storage_tier)
+                    cached.setdefault("db_source", "REDIS")
+                    cached.setdefault("region", "us-east-1")
+                    cached["cache_hit"] = True
+                    return create_response(200, cached)
+            except Exception as e:
+                print(f"WARNING: Redis cache lookup skipped: {e}")
         # 4. Decide whether to use EFS, with rehydration for COLD tenants
         efs_db_path = os.path.join(EFS_MOUNT_DIR, db_key) if (EFS_MOUNT_DIR and db_key) else None
         db_source = None
@@ -157,12 +277,30 @@ def lambda_handler(event, context):
                     cursor.execute(sql_query)
                     rows = cursor.fetchall()
                     result = [dict(row) for row in rows]
+
+                    # Populate Redis cache on miss
+                    if redis_client and _is_cacheable_read(sql_query):
+                        try:
+                            ver = _get_tenant_ver(redis_client, tenant_id)
+                            ck = _cache_key(tenant_id, ver, sql_query)
+                            _cache_set_json(redis_client, ck, {
+                                "success": True,
+                                "data": result,
+                                "row_count": len(result),
+                                "storage_tier": storage_tier,
+                                "db_source": db_source,
+                                "region": "us-east-1",
+                                "cache_hit": False
+                            }, REDIS_TTL_SECONDS)
+                        except Exception as e:
+                            print(f"WARNING: Redis cache set skipped: {e}")
                     return create_response(200, {
                         'success': True,
                         'data': result,
                         'row_count': len(result),
                         'storage_tier': storage_tier,
-                        'db_source': db_source or 'EFS'
+                        'db_source': db_source or 'EFS',
+                        'region': 'us-east-1'
                     })
                 except sqlite3.Error as e:
                     return create_response(400, {'error': f'SQL query execution failed: {str(e)}'})
@@ -193,6 +331,23 @@ def lambda_handler(event, context):
                     cursor.execute(sql_query)
                     rows = cursor.fetchall()
                     result = [dict(row) for row in rows]
+
+                    # Populate Redis cache on miss
+                    if redis_client and _is_cacheable_read(sql_query):
+                        try:
+                            ver = _get_tenant_ver(redis_client, tenant_id)
+                            ck = _cache_key(tenant_id, ver, sql_query)
+                            _cache_set_json(redis_client, ck, {
+                                "success": True,
+                                "data": result,
+                                "row_count": len(result),
+                                "storage_tier": storage_tier,
+                                "db_source": db_source,
+                                "region": "us-east-1",
+                                "cache_hit": False
+                            }, REDIS_TTL_SECONDS)
+                        except Exception as e:
+                            print(f"WARNING: Redis cache set skipped: {e}")
                     return create_response(200, {
                         'success': True,
                         'data': result,

@@ -20,9 +20,71 @@ SNS_TOPIC_ARN = os.environ.get(
     'SNS_TOPIC_ARN', 'arn:aws:sns:us-east-1:666802050343:ReplicationStack-WriteTopic-wyk88ACy3a2i'
 )
 
-# Optional env vars for AccessTenant / hot cold logic
+# env vars for AccessTenant / hot cold logic
 EFS_MOUNT_DIR = os.environ.get('EFS_MOUNT_DIR', '/mnt/efs')
 REHYDRATION_FUNCTION_NAME = os.environ.get('REHYDRATION_FUNCTION_NAME')
+
+# ------------------------
+# Redis (ElastiCache) invalidation
+# ------------------------
+try:
+    import redis  # provided via Lambda Layer
+except Exception:
+    redis = None
+
+REDIS_ENABLED = os.environ.get("REDIS_ENABLED", "false").lower() == "true"
+REDIS_HOST = os.environ.get("REDIS_HOST")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+REDIS_TLS = os.environ.get("REDIS_TLS", "false").lower() == "true"
+REDIS_AUTH_TOKEN = os.environ.get("REDIS_AUTH_TOKEN")
+REDIS_CONNECT_TIMEOUT_MS = int(os.environ.get("REDIS_CONNECT_TIMEOUT_MS", "50"))
+REDIS_SOCKET_TIMEOUT_MS = int(os.environ.get("REDIS_SOCKET_TIMEOUT_MS", "50"))
+
+_redis_client = None
+
+
+def _get_redis_client():
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    if not (REDIS_ENABLED and redis and REDIS_HOST):
+        _redis_client = None
+        return None
+    try:
+        kwargs = dict(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            socket_connect_timeout=REDIS_CONNECT_TIMEOUT_MS / 1000.0,
+            socket_timeout=REDIS_SOCKET_TIMEOUT_MS / 1000.0,
+            decode_responses=False,
+        )
+        if REDIS_TLS:
+            kwargs["ssl"] = True
+        if REDIS_AUTH_TOKEN:
+            kwargs["password"] = REDIS_AUTH_TOKEN
+        client = redis.Redis(**kwargs)
+        client.ping()
+        _redis_client = client
+        return client
+    except Exception as e:
+        print(f"WARNING: Redis invalidation disabled/unreachable: {e}")
+        _redis_client = None
+        return None
+
+
+def _tenant_ver_key(tenant_id: str) -> str:
+    return f"octodb:tenant:{tenant_id}:ver"
+
+
+def bump_cache_version(tenant_id: str):
+    client = _get_redis_client()
+    if not client or not tenant_id:
+        return
+    try:
+        client.incr(_tenant_ver_key(tenant_id))
+        print(f"Redis cache version bumped for tenant_id={tenant_id}")
+    except Exception as e:
+        print(f"WARNING: Redis cache version bump failed: {e}")
 
 
 def lambda_handler(event, context):
@@ -279,6 +341,8 @@ def lambda_handler(event, context):
                 return create_response(500, {
                     'error': f'Failed to update replica metadata: {str(e)}'
                 })
+
+            bump_cache_version(tenant_id)
 
             print(f'Write operation completed successfully for tenant: {tenant_name}')
             return create_response(200, {
