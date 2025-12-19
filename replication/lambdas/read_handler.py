@@ -119,7 +119,10 @@ def lambda_handler(event, context):
                     return create_response(200, {
                         'success': True,
                         'data': result,
-                        'row_count': len(result)
+                        'row_count': len(result),
+                        'source': {
+                            'region': 'us-east-1',
+                        }
                     })
                     
                 except sqlite3.Error as e:
