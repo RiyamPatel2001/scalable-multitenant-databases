@@ -28,6 +28,9 @@ def lambda_handler(event, context):
         "sql_query": "SELECT * FROM Users;"
     }
     """
+    if os.environ.get('FORCE_ERROR') == 'True':
+        return create_response(500, {'error': 'Simulated failure'})
+
     try:
         if 'body' not in event:
             return create_response(400, {'error': 'Request body is missing'})
@@ -195,7 +198,8 @@ def lambda_handler(event, context):
                         'data': result,
                         'row_count': len(result),
                         'storage_tier': storage_tier,
-                        'db_source': db_source or 'S3_READ_REPLICA'
+                        'db_source': db_source or 'S3_READ_REPLICA',
+                        'region': 'us-east-1'
                     })
                 except sqlite3.Error as e:
                     return create_response(400, {
