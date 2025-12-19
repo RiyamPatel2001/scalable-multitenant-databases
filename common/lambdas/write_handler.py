@@ -289,7 +289,8 @@ def lambda_handler(event, context):
                 'snapshot_s3_key': snapshot_s3_key,
                 'last_updated_at': current_timestamp,
                 'storage_tier': storage_tier,
-                'db_source': 'EFS' if use_efs else 'S3_PRIMARY'
+                'db_source': 'EFS' if use_efs else 'S3_PRIMARY',
+                'region': 'us-east-1'
             })
 
         finally:
